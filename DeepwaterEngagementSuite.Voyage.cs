@@ -79,6 +79,15 @@ public partial class DeepwaterEngagementSuite
     private static bool TileHasChart(VoyageTileElement tile) =>
         tile?.ItemContainer?.Entity?.GetComponent<DeepwaterChart>() != null;
 
+    private static Direction? GetTileOrientation(VoyageTileElement tile)
+    {
+        var chart = tile?.ItemContainer?.Entity?.GetComponent<DeepwaterChart>();
+        if (chart?.Room == null)
+            return null;
+
+        return ((Direction)chart.Room.Path).RotateCcw(chart.Rotation);
+    }
+
     private static bool BoardIsClear(VoyageWindow tree) =>
         tree.Tiles.All(t => !TileHasChart(t));
 
@@ -198,10 +207,32 @@ public partial class DeepwaterEngagementSuite
                           TileHasChart(tile),
                     TimeSpan.FromSeconds(1));
 
-                while (tile.ItemContainer?.Entity.GetComponent<DeepwaterChart>()?.Rotation is { } rot &&
-                       rot != p.Rotation)
+                // The chart component can lag a frame or two behind the
+                // placement click; without this wait the rotation loop below
+                // used to read null once and silently skip rotating.
+                await TaskUtils.CheckEveryFrameWithThrow(
+                    () => GetTileOrientation(tile) != null,
+                    () => "Placed chart component never appeared",
+                    TimeSpan.FromSeconds(1));
+
+                // Compare the resulting orientation (Room.Path rotated by the
+                // counter - same formula the optimizer's match markers use)
+                // instead of the raw counter: symmetric pieces reach the
+                // target orientation at several counter values, so insisting
+                // on counter equality over-clicks and can never terminate if
+                // the game normalizes the counter.
+                var rotationClicks = 0;
+                while (GetTileOrientation(tile) is { } orientation &&
+                       orientation != p.Connections)
                 {
-                    DebugWindow.LogMsg($"{rot}, {p.Rotation}");
+                    if (++rotationClicks > 4)
+                    {
+                        DebugWindow.LogError(
+                            $"Voyage Place: piece #{p.Piece.Id} stuck at orientation {orientation}, wanted {p.Connections}");
+                        return false;
+                    }
+
+                    var counterBefore = tile.ItemContainer?.Entity?.GetComponent<DeepwaterChart>()?.Rotation;
                     var click3Pos = winOrigin + tile.GetClientRectCache.Center.ToVector2Num();
                     Input.SetCursorPos(click3Pos);
                     await TaskUtils.CheckEveryFrameWithThrow(
@@ -211,8 +242,8 @@ public partial class DeepwaterEngagementSuite
                     await TaskUtils.NextFrame();
                     Input.RightUp();
                     await TaskUtils.CheckEveryFrameWithThrow(
-                        () => tile.ItemContainer?.Entity?.GetComponent<DeepwaterChart>()?.Rotation is { } rot2 &&
-                              rot2 != rot,
+                        () => tile.ItemContainer?.Entity?.GetComponent<DeepwaterChart>()?.Rotation is { } counter &&
+                              counter != counterBefore,
                         TimeSpan.FromSeconds(1));
                 }
             }
