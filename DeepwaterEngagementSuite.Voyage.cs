@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -127,12 +128,26 @@ public partial class DeepwaterEngagementSuite
             }
 
             var availableCharts = GetAvailableCharts();
+
+            // Place charts from the currently visible inventory tab first so
+            // a mixed-tab solution switches tabs once instead of potentially
+            // once per piece.
+            var placements = new List<(VoyageTileElement Tile, MapPiecePlacement P)>();
             for (var i = 0; i < 9; i++)
             {
-                var tile = tree.Tiles[i];
                 var p = solution.Grid[i / 3, i % 3];
-                if (p?.Piece == null)
-                    continue;
+                if (p?.Piece != null)
+                    placements.Add((tree.Tiles[i], p));
+            }
+
+            placements = placements
+                .OrderByDescending(x => x.P.Piece.Id >= 0 &&
+                                        x.P.Piece.Id < availableCharts.Count &&
+                                        availableCharts[x.P.Piece.Id].IsVisible)
+                .ToList();
+
+            foreach (var (tile, p) in placements)
+            {
                 if (p.Piece.Id < 0 || p.Piece.Id >= availableCharts.Count)
                 {
                     DebugWindow.LogError($"Voyage Place: piece id {p.Piece.Id} out of range ({availableCharts.Count} charts)");
@@ -140,6 +155,17 @@ public partial class DeepwaterEngagementSuite
                 }
 
                 var pieceElem = availableCharts[p.Piece.Id];
+                if (!pieceElem.IsVisible && !await TrySwitchChartTab(tree, pieceElem))
+                {
+                    // A chart on the inactive inventory tab can never be
+                    // hovered, so the pickup click below would stall until its
+                    // timeout.
+                    DebugWindow.LogError(
+                        $"Voyage Place: chart #{p.Piece.Id} is on the other chart tab and " +
+                        "automatic tab switching failed - see voyage_ui_dump.txt in the plugin folder.");
+                    return false;
+                }
+
                 var click1Pos = winOrigin + pieceElem.GetClientRectCache.Center.ToVector2Num();
                 var click2Pos = winOrigin + tile.GetClientRectCache.Center.ToVector2Num();
                 Input.SetCursorPos(click1Pos);
@@ -341,6 +367,238 @@ public partial class DeepwaterEngagementSuite
         }
     }
 
+    // The chart inventory has multiple tabs; ExileCore's VoyageWindow doesn't
+    // expose the tab buttons, so they are located by shape instead of by a
+    // hardcoded child path: a horizontal run of 2-4 equal-size button-height
+    // elements sitting just above the chart container (measured via DevTree:
+    // 96x42 at 0.9 UI scale, exactly adjacent, shiny-highlight on hover).
+    private List<ExileCore.PoEMemory.Element> FindChartTabButtons(VoyageWindow tree)
+    {
+        // Fast path: the tab strip sits at a fixed child path under
+        // VoyageWindow (verified against a live UI dump: strip=[3.11.0],
+        // children are [tab1, full-width background, tab2] with the page
+        // number as nested text). The buttons are the narrow children.
+        var strip = tree.GetChildFromIndices(3, 11, 0);
+        if (strip is { IsVisibleLocal: true })
+        {
+            var stripWidth = strip.GetClientRectCache.Width;
+            var directButtons = (strip.Children ?? Enumerable.Empty<ExileCore.PoEMemory.Element>())
+                .Where(c => c is { IsVisibleLocal: true })
+                .Where(c =>
+                {
+                    var r = c.GetClientRectCache;
+                    return r.Height > 10 && r.Width > 10 && r.Width < stripWidth * 0.5f;
+                })
+                .OrderBy(c => c.GetClientRectCache.Left)
+                .ToList();
+            if (directButtons.Count >= 2)
+                return directButtons;
+        }
+
+        // Fallback if a game patch moves the strip: locate by shape.
+        var container = tree.ChartContainer?.GetClientRectCache ?? default;
+        if (container.Width <= 0 || container.Height <= 0)
+            return [];
+
+        var clearRect = tree.ClearButton?.GetClientRectCache ?? default;
+        var startRect = tree.StartButton?.GetClientRectCache ?? default;
+        var chartRects = (tree.AvailableCharts ?? [])
+            .Where(c => c.IsVisible)
+            .Select(c => c.GetClientRectCache)
+            .ToList();
+
+        var all = new List<ExileCore.PoEMemory.Element>();
+        CollectVisibleElements(tree, all, 0);
+
+        // Nested wrappers share the same rect (the buttons have a single
+        // child); keep the deepest element per rect since that's what the
+        // game reports as hovered.
+        var byRect = new Dictionary<(int, int, int, int), ExileCore.PoEMemory.Element>();
+        foreach (var element in all)
+        {
+            var r = element.GetClientRectCache;
+            if (r.Height is <= 25 or >= 75 || r.Width is <= 55 or >= 180)
+                continue;
+            if (r.Bottom > container.Top + 40 || r.Bottom < container.Top - 160)
+                continue;
+            if (r.Right < container.Left - 30 || r.Left > container.Right + 30)
+                continue;
+            if (r.Intersects(clearRect) || r.Intersects(startRect))
+                continue;
+            if (chartRects.Any(c => c.Intersects(r)))
+                continue;
+            byRect[((int)Math.Round(r.Left / 2), (int)Math.Round(r.Top / 2),
+                (int)Math.Round(r.Width / 2), (int)Math.Round(r.Height / 2))] = element;
+        }
+
+        // Group the survivors into rows, then find an adjacent equal-size run.
+        var rows = byRect.Values
+            .GroupBy(e => (int)Math.Round(e.GetClientRectCache.Top / 8))
+            .OrderByDescending(g => g.Key);
+        foreach (var row in rows)
+        {
+            var ordered = row.OrderBy(e => e.GetClientRectCache.Left).ToList();
+            for (var start = 0; start < ordered.Count; start++)
+            {
+                var run = new List<ExileCore.PoEMemory.Element> { ordered[start] };
+                for (var next = start + 1; next < ordered.Count; next++)
+                {
+                    var prev = run[^1].GetClientRectCache;
+                    var cand = ordered[next].GetClientRectCache;
+                    if (Math.Abs(cand.Left - prev.Right) > 10 ||
+                        Math.Abs(cand.Width - prev.Width) > 12 ||
+                        Math.Abs(cand.Height - prev.Height) > 6)
+                        break;
+                    run.Add(ordered[next]);
+                }
+
+                if (run.Count is >= 2 and <= 4)
+                    return run;
+            }
+        }
+
+        return [];
+    }
+
+    private static void CollectVisibleElements(ExileCore.PoEMemory.Element element,
+        List<ExileCore.PoEMemory.Element> sink, int depth)
+    {
+        if (element == null || depth > 8 || !element.IsVisibleLocal)
+            return;
+
+        sink.Add(element);
+        var children = element.Children;
+        if (children == null)
+            return;
+
+        foreach (var child in children)
+            CollectVisibleElements(child, sink, depth + 1);
+    }
+
+    private async SyncTask<bool> TrySwitchChartTab(VoyageWindow tree,
+        NormalInventoryItem targetChart)
+    {
+        var buttons = FindChartTabButtons(tree);
+        if (buttons.Count == 0)
+        {
+            DumpVoyageUi(tree);
+            return false;
+        }
+
+        var winOrigin = GameController.Window.GetWindowRectangleTimeCache.TopLeft.ToVector2Num();
+
+        // One of the buttons is the already-active tab; clicking it is
+        // harmless, so just try them in order until the chart shows up.
+        // requireHighlight=false is a second pass for the case where the
+        // shiny-highlight read misbehaves - the click is still aimed at a
+        // shape-verified tab button.
+        foreach (var requireHighlight in new[] { true, false })
+        {
+            foreach (var button in buttons)
+            {
+                if (targetChart.IsVisible)
+                    return true;
+
+                var clickPos = winOrigin + button.GetClientRectCache.Center.ToVector2Num();
+                Input.SetCursorPos(clickPos);
+                if (requireHighlight)
+                {
+                    try
+                    {
+                        await TaskUtils.CheckEveryFrameWithThrow(
+                            () => button.HasShinyHighlight ||
+                                  (button.Children?.Any(c => c.HasShinyHighlight) ?? false),
+                            TimeSpan.FromMilliseconds(700));
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                }
+                else
+                {
+                    await TaskUtils.NextFrame();
+                }
+
+                Input.LeftDown();
+                await TaskUtils.NextFrame();
+                Input.LeftUp();
+
+                try
+                {
+                    await TaskUtils.CheckEveryFrameWithThrow(
+                        () => targetChart.IsVisible,
+                        TimeSpan.FromMilliseconds(700));
+                    return true;
+                }
+                catch
+                {
+                    // Chart still hidden; try the next button.
+                }
+            }
+        }
+
+        if (targetChart.IsVisible)
+            return true;
+
+        DumpVoyageUi(tree);
+        return false;
+    }
+
+    private void DumpVoyageUi(VoyageWindow tree)
+    {
+        try
+        {
+            var path = Path.Combine(DirectoryFullName, "voyage_ui_dump.txt");
+            using (var writer = new StreamWriter(path, false))
+            {
+                writer.WriteLine($"=== VoyageWindow dump {DateTime.Now:O} ===");
+
+                writer.WriteLine("--- AvailableCharts (unfiltered) ---");
+                var charts = tree.AvailableCharts ?? [];
+                for (var i = 0; i < charts.Count; i++)
+                {
+                    var chart = charts[i];
+                    var room = chart?.Item?.GetComponent<DeepwaterChart>()?.Room.Name;
+                    writer.WriteLine(
+                        $"#{i} addr={chart?.Address:X} visible={chart?.IsVisible} " +
+                        $"rect={chart?.GetClientRectCache} room={room}");
+                }
+
+                writer.WriteLine("--- ChartContainer addr ---");
+                writer.WriteLine($"{tree.ChartContainer?.Address:X}");
+
+                writer.WriteLine("--- Element tree ---");
+                DumpElementRecursive(writer, tree, "", 0);
+            }
+
+            DebugWindow.LogMsg($"Voyage UI dumped to {path}", 10);
+        }
+        catch (Exception ex)
+        {
+            DebugWindow.LogError($"Voyage UI dump failed: {ex.Message}");
+        }
+    }
+
+    private static void DumpElementRecursive(StreamWriter writer, ExileCore.PoEMemory.Element element, string path, int depth)
+    {
+        if (element == null || depth > 8)
+            return;
+
+        var text = element.Text;
+        text = string.IsNullOrWhiteSpace(text) ? "" : $" text=\"{text.Replace("\n", "\\n")}\"";
+        writer.WriteLine(
+            $"{new string(' ', depth * 2)}[{path}] addr={element.Address:X} vis={element.IsVisibleLocal} " +
+            $"rect={element.GetClientRectCache} children={element.ChildCount}{text}");
+
+        var children = element.Children;
+        if (children == null)
+            return;
+
+        for (var i = 0; i < children.Count; i++)
+            DumpElementRecursive(writer, children[i], path.Length == 0 ? i.ToString() : $"{path}.{i}", depth + 1);
+    }
+
     private static Dictionary<int, List<ItemMod>> GetTileMods(VoyageWindow tree)
     {
         var borderMods = tree.Data.BorderMods;
@@ -416,6 +674,12 @@ public partial class DeepwaterEngagementSuite
 
                 _voyageSolving = false;
             });
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Dump UI"))
+        {
+            DumpVoyageUi(tree);
         }
 
         if (_voyageSolve != null && _voyageSolving && !Settings.VoyageSettings.UseFastSolver.Value)
