@@ -1009,6 +1009,27 @@ public partial class DeepwaterEngagementSuite
             ImGui.TextDisabled($"(strategy objective: {currentObjective:F2})");
         }
 
+        // A negative objective is almost always layout deviation penalties;
+        // show the adherence directly so the number explains itself.
+        if (selectedStrategy?.Layouts is { Length: > 0 })
+        {
+            var variant = selectedStrategy.Layouts.FirstOrDefault(l => l.Id == selectedLayoutId)
+                          ?? selectedStrategy.Layouts[0];
+            var matched = 0;
+            for (var cell = 0; cell < 9; cell++)
+            {
+                if (currentSolution.Grid[cell / 3, cell % 3]?.Connections == variant.Arms[cell])
+                    matched++;
+            }
+
+            ImGui.Text($"Layout: {matched}/9 tiles match");
+            if (matched < 5)
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled("(free charts lack the shapes - penalties drag the objective down)");
+            }
+        }
+
         ImGui.Text($"Valid: {(currentSolution.IsValid ? "Yes" : "No")}");
 
         if (_result.Solutions.Count > 0)
