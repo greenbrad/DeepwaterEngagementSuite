@@ -11,6 +11,7 @@ public class VoyagePlannerFast
     private const int GridSize = 3;
     private const int Cells = GridSize * GridSize;
     private const int States = 1 << Cells;
+    private const double LockBonus = 1e9;
 
     private static readonly (Direction Dir, int Dr, int Dc)[] Dirs =
     [
@@ -93,7 +94,26 @@ public class VoyagePlannerFast
         return seen == States - 1;
     }
 
-    public IEnumerable<VoyageSolutionResult> Solve(VoyagePuzzle puzzle, VoyagePlannerSettings settings = null)
+    // Pieces with the same rotation set and modifier signature are interchangeable for both
+    // connectivity and scoring, so the DP only needs one entry per distinct group (with
+    // multiplicity), not one per chart. Locked pieces stay in singleton groups.
+    private sealed class Group
+    {
+        public List<int> Members = [];
+        public MapPiece Piece;
+        public int ArmCount;
+        public int LockedCell = -1;
+        public int[] Eligible = new int[Cells];
+        public byte[] Rotation = new byte[Cells * 16];
+
+        // Per cell: strategy-layout penalty if this group cannot realize the
+        // exact target arms there (applied only when the topology matches the
+        // layout's in-grid arms; otherwise the whole cell already pays).
+        public double[] LayoutPen = new double[Cells];
+    }
+
+    public IEnumerable<VoyageSolutionResult> Solve(
+        VoyagePuzzle puzzle, VoyagePlannerSettings settings = null, StrategyContext strategy = null)
     {
         settings ??= new VoyagePlannerSettings();
         var pieces = puzzle.AvailablePieces;
@@ -106,203 +126,482 @@ public class VoyagePlannerFast
             yield break;
         }
 
-        // Per-cell border factors for a given tag. Per-connection borders are skipped entirely for
-        // now: they break separability, so we ignore their effect rather than model it.
-        // TODO: add per-connection border mod support. There is one that increases quantity per connection
+        // Reported solution scores come from the real scorer so they always agree with the
+        // score-details UI and never contain lock bonuses; the solver-internal score (which
+        // does contain lock bonuses so locks dominate) is only used for ranking and pruning.
+        var scorer = new VoyageScorer(puzzle);
+
         var borders = new IReadOnlyList<BorderEffect>[Cells];
         for (var cell = 0; cell < Cells; cell++)
             borders[cell] = puzzle.TileBorders?[cell / GridSize, cell % GridSize] ?? [];
 
-        double TileFactor(int cell, ModifierTag tags)
+        // Cells carrying at least one per-connection border. Their multipliers depend on the
+        // connection count of the piece placed there — but connection count is the piece's
+        // total arm count, which is rotation-invariant. So exactness only needs a small
+        // enumeration of arm counts over these cells; everything else stays separable.
+        var perConnCells = new List<int>();
+        for (var cell = 0; cell < Cells; cell++)
+            if (borders[cell].Any(b => b.PerConnection))
+                perConnCells.Add(cell);
+
+        double TileFactor(int cell, ModifierTag tags, int conn)
         {
             double m = 1;
             foreach (var b in borders[cell])
-                if (!b.PerConnection && !b.AffectsPlacedChart && ModifierTagParser.Matches(b.Tags, tags))
-                    m *= b.Multiplier;
-            return m;
-        }
-
-        double ChartFactor(int cell, ModifierTag tags)
-        {
-            double m = 1;
-            foreach (var b in borders[cell])
-                if (!b.PerConnection && b.AffectsPlacedChart && ModifierTagParser.Matches(b.Tags, tags))
-                    m *= b.Multiplier;
-            return m;
-        }
-
-        double NeighbourTileSum(int cell, ModifierTag tags)
-        {
-            var r = cell / GridSize;
-            var c = cell % GridSize;
-            double sum = 0;
-            foreach (var (_, dr, dc) in Dirs)
             {
-                var nr = r + dr;
-                var nc = c + dc;
-                if (nr < 0 || nr >= GridSize || nc < 0 || nc >= GridSize) continue;
-                sum += TileFactor(nr * GridSize + nc, tags);
+                if (b.AffectsPlacedChart || !ModifierTagParser.Matches(b.Tags, tags)) continue;
+                m *= PerConnValue(b, conn);
             }
 
-            return sum;
+            return m;
         }
 
-        double Global(ModifierTag tags)
+        double ChartFactor(int cell, ModifierTag tags, int conn)
         {
-            double sum = 0;
-            for (var cell = 0; cell < Cells; cell++) sum += TileFactor(cell, tags);
-            return sum;
+            double m = 1;
+            foreach (var b in borders[cell])
+            {
+                if (!b.AffectsPlacedChart || !ModifierTagParser.Matches(b.Tags, tags)) continue;
+                m *= PerConnValue(b, conn);
+            }
+
+            return m;
         }
 
-        // weight[i][cell] = DES score contributed if chart i sits on cell: its local mods delivered
-        // to its neighbours, plus its global mods against the whole board.
-        var weight = new double[n][];
-        var eligible = new int[n][];
-        var rotation = new byte[n][];
+        // conn < 0 means "unknown": use the most optimistic value so bounds stay admissible.
+        static double PerConnValue(BorderEffect b, int conn)
+        {
+            if (!b.PerConnection) return b.Multiplier;
+            if (conn >= 0) return Math.Max(0, 1 + (b.Multiplier - 1) * conn);
+            double best = 0;
+            for (var k = 1; k <= 4; k++)
+                best = Math.Max(best, Math.Max(0, 1 + (b.Multiplier - 1) * k));
+            return best;
+        }
 
+        // ---- group interchangeable pieces ----
+        var lockByPiece = new Dictionary<int, LockedPlacement>();
+        foreach (var lp in puzzle.LockedPlacements ?? [])
+        {
+            var idx = pieces.FindIndex(p => p.Id == lp.PieceId);
+            if (idx >= 0) lockByPiece[idx] = lp;
+        }
+
+        var groups = new List<Group>();
+        var groupIndex = new Dictionary<string, int>();
         for (var i = 0; i < n; i++)
         {
             var piece = pieces[i];
-            weight[i] = new double[Cells];
-            eligible[i] = new int[Cells];
-            rotation[i] = new byte[Cells * 16];
-            rotation[i].AsSpan().Fill(byte.MaxValue);
-
-            for (var cell = 0; cell < Cells; cell++)
+            if (lockByPiece.ContainsKey(i))
             {
-                double w = 0;
-                foreach (var mod in piece.Modifiers)
-                {
-                    if (mod.Weight == 0) continue;
-                    var cf = ChartFactor(cell, mod.Tags);
-                    w += mod.IsGlobal
-                        ? mod.Weight * cf * Global(mod.Tags)
-                        : mod.Weight * cf * NeighbourTileSum(cell, mod.Tags);
-                }
-
-                weight[i][cell] = w;
+                groups.Add(new Group { Piece = piece, Members = { i } });
+                continue;
             }
 
-            // which inward arm-sets this chart can present at each cell, and one rotation per set.
+            var canon = int.MaxValue;
             for (var rot = 0; rot < piece.DistinctRotations; rot++)
+                canon = Math.Min(canon, (int)piece.GetConnections(rot));
+
+            // Strategy bonuses differentiate otherwise-identical pieces (by
+            // room name / matched rules), so the bonus row is part of the key.
+            var bonusKey = strategy == null
+                ? ""
+                : string.Join(",", strategy.Bonus[i].Select(b => b.ToString("R")));
+            var key = $"{canon}|{GetModifierSignature(piece)}|{bonusKey}";
+            if (!groupIndex.TryGetValue(key, out var g))
             {
-                var conn = (int)piece.GetConnections(rot);
+                g = groups.Count;
+                groupIndex[key] = g;
+                groups.Add(new Group { Piece = piece });
+            }
+
+            groups[g].Members.Add(i);
+        }
+
+        // Eligibility per group: which inward arm-sets it can present per cell, plus one
+        // rotation per set. Locks pin the piece to its cell and honor a fixed rotation.
+        foreach (var group in groups)
+        {
+            group.ArmCount = BitOperations.PopCount((uint)group.Piece.BaseConnections);
+            group.Rotation.AsSpan().Fill(byte.MaxValue);
+
+            var pieceIdx = group.Members[0];
+            LockedPlacement lockInfo = null;
+            if (group.Members.Count == 1 && lockByPiece.TryGetValue(pieceIdx, out var lp))
+            {
+                lockInfo = lp;
+                group.LockedCell = lp.Row * GridSize + lp.Col;
+            }
+
+            for (var rot = 0; rot < group.Piece.DistinctRotations; rot++)
+            {
+                if (lockInfo?.Rotation is { } lockedRot && rot != lockedRot) continue;
+                var conn = (int)group.Piece.GetConnections(rot);
                 for (var cell = 0; cell < Cells; cell++)
                 {
+                    if (group.LockedCell >= 0 && cell != group.LockedCell) continue;
                     var inGrid = conn & InGrid[cell];
                     var slot = cell * 16 + inGrid;
-                    if (rotation[i][slot] != byte.MaxValue) continue;
-                    eligible[i][cell] |= 1 << inGrid;
-                    rotation[i][slot] = (byte)rot;
+                    if (group.Rotation[slot] != byte.MaxValue) continue;
+                    group.Eligible[cell] |= 1 << inGrid;
+                    group.Rotation[slot] = (byte)rot;
+                }
+            }
+
+            // Strategy layout: where possible prefer the rotation realizing the
+            // exact target arms (off-grid arms included); where the shape can't,
+            // record the per-cell deviation penalty.
+            if (strategy != null && strategy.LayoutPenalty > 0)
+            {
+                for (var cell = 0; cell < Cells; cell++)
+                {
+                    if (strategy.LayoutArms[cell] is not { } target) continue;
+                    if (group.LockedCell >= 0 && cell != group.LockedCell) continue;
+
+                    var realized = false;
+                    for (var rot = 0; rot < group.Piece.DistinctRotations; rot++)
+                    {
+                        if (lockInfo?.Rotation is { } lockedRot && rot != lockedRot) continue;
+                        var conn = (int)group.Piece.GetConnections(rot);
+                        if (conn != (int)target) continue;
+                        group.Rotation[cell * 16 + (conn & InGrid[cell])] = (byte)rot;
+                        realized = true;
+                        break;
+                    }
+
+                    if (!realized)
+                        group.LayoutPen[cell] = strategy.LayoutPenalty;
                 }
             }
         }
 
-        ApplyLocks(puzzle, pieces, weight, eligible);
+        var groupCount = groups.Count;
 
-        var reachable = new int[Topologies.Length][];
+        // weight[g][cell] with a given arm-count profile for the per-connection cells
+        // (profile == null → optimistic upper-bound weights, used for topology ordering;
+        // with no per-connection borders those weights are simply exact).
+        double[][] ComputeWeights(int[] connAtCell)
+        {
+            var sByTag = new Dictionary<ModifierTag, double>();
+
+            double GlobalSum(ModifierTag tags)
+            {
+                if (sByTag.TryGetValue(tags, out var cached)) return cached;
+                double sum = 0;
+                for (var cell = 0; cell < Cells; cell++)
+                    sum += TileFactor(cell, tags, connAtCell?[cell] ?? -1);
+                return sByTag[tags] = sum;
+            }
+
+            var weight = new double[groupCount][];
+            for (var g = 0; g < groupCount; g++)
+            {
+                weight[g] = new double[Cells];
+                var group = groups[g];
+                for (var cell = 0; cell < Cells; cell++)
+                {
+                    double w = 0;
+                    foreach (var mod in group.Piece.Modifiers)
+                    {
+                        if (mod.Weight == 0) continue;
+                        var cf = ChartFactor(cell, mod.Tags, connAtCell?[cell] ?? -1);
+                        if (mod.IsGlobal)
+                        {
+                            w += mod.Weight * cf * GlobalSum(mod.Tags);
+                        }
+                        else
+                        {
+                            var r = cell / GridSize;
+                            var c = cell % GridSize;
+                            double sum = 0;
+                            foreach (var (_, dr, dc) in Dirs)
+                            {
+                                var nr = r + dr;
+                                var nc = c + dc;
+                                if (nr < 0 || nr >= GridSize || nc < 0 || nc >= GridSize) continue;
+                                var v = nr * GridSize + nc;
+                                sum += TileFactor(v, mod.Tags, connAtCell?[v] ?? -1);
+                            }
+
+                            w += mod.Weight * cf * sum;
+                        }
+                    }
+
+                    weight[g][cell] = w + (strategy?.Bonus[group.Members[0]][cell] ?? 0);
+                }
+            }
+
+            ApplyLockBonuses(groups, weight);
+            return weight;
+        }
+
+        var upperWeight = ComputeWeights(null);
+        var exactWhenNoPerConn = perConnCells.Count == 0 ? upperWeight : null;
+
+        // Strategy layout targets, split into in-grid arms (constrains the
+        // topology) and full arms (constrains piece rotation at the cell).
+        var layoutInGrid = new int[Cells];
+        Array.Fill(layoutInGrid, -1);
+        var hasLayout = false;
+        if (strategy is { LayoutPenalty: > 0 })
+        {
+            for (var cell = 0; cell < Cells; cell++)
+            {
+                if (strategy.LayoutArms[cell] is not { } target) continue;
+                layoutInGrid[cell] = (int)target & InGrid[cell];
+                hasLayout = true;
+            }
+        }
+
+        // Admissible per-topology bound: per-cell best eligible group, per-conn at optimum.
         var bound = new double[Topologies.Length];
-
+        var reachable = new int[Topologies.Length][];
+        var topoPen = new double[Topologies.Length];
         for (var t = 0; t < Topologies.Length; t++)
         {
             var topo = Topologies[t];
-            var allow = new int[n];
+            var allow = new int[groupCount];
             var total = 0.0;
             var feasible = true;
 
             for (var cell = 0; cell < Cells && feasible; cell++)
             {
                 var best = double.NegativeInfinity;
-                for (var i = 0; i < n; i++)
+                for (var g = 0; g < groupCount; g++)
                 {
-                    if ((eligible[i][cell] >> topo[cell] & 1) == 0) continue;
-                    allow[i] |= 1 << cell;
-                    if (weight[i][cell] > best) best = weight[i][cell];
+                    if ((groups[g].Eligible[cell] >> topo[cell] & 1) == 0) continue;
+                    allow[g] |= 1 << cell;
+                    if (upperWeight[g][cell] > best) best = upperWeight[g][cell];
                 }
 
                 if (double.IsNegativeInfinity(best)) feasible = false;
                 else total += best;
             }
 
+            if (hasLayout)
+            {
+                for (var cell = 0; cell < Cells; cell++)
+                {
+                    if (layoutInGrid[cell] >= 0 && topo[cell] != layoutInGrid[cell])
+                        topoPen[t] += strategy.LayoutPenalty;
+                }
+            }
+
             reachable[t] = allow;
-            bound[t] = feasible ? total : double.NegativeInfinity;
+            bound[t] = feasible ? total - topoPen[t] : double.NegativeInfinity;
         }
 
         var order = Enumerable.Range(0, Topologies.Length).OrderByDescending(t => bound[t]).ToArray();
 
+        // DP entries: one per usable copy of each group (at most 9 copies matter).
+        var entryGroup = new List<int>();
+        for (var g = 0; g < groupCount; g++)
+        {
+            var copies = Math.Min(groups[g].Members.Count, Cells);
+            for (var k = 0; k < copies; k++) entryGroup.Add(g);
+        }
+
+        var entries = entryGroup.ToArray();
         var dpPrev = new double[States];
         var dpNext = new double[States];
-        var choice = new byte[n][];
-        for (var i = 0; i < n; i++) choice[i] = new byte[States];
+        var choice = new byte[entries.Length][];
+        for (var i = 0; i < entries.Length; i++) choice[i] = new byte[States];
 
-        var top = new List<VoyageSolution>(topN);
+        var top = new List<(double Internal, VoyageSolution Solution)>(topN);
         var explored = 0L;
         var pruned = 0L;
         var assignment = new int[Cells];
+        var profileConn = new int[Cells];
+        var groupUse = new int[groupCount];
 
         for (var o = 0; o < order.Length; o++)
         {
             var t = order[o];
 
-            if (double.IsNegativeInfinity(bound[t]) || (top.Count >= topN && bound[t] <= top[^1].TotalScore))
+            if (double.IsNegativeInfinity(bound[t]) || (top.Count >= topN && bound[t] <= top[^1].Internal))
             {
                 pruned += order.Length - o;
                 break;
             }
 
             explored++;
-            var score = BestAssignment(n, weight, reachable[t], dpPrev, dpNext, choice, assignment);
-            if (double.IsNegativeInfinity(score)) continue;
-            if (top.Count >= topN && score <= top[^1].TotalScore) continue;
-
             var topo = Topologies[t];
-            var grid = new MapPiecePlacement[GridSize, GridSize];
-            for (var cell = 0; cell < Cells; cell++)
-            {
-                var piece = pieces[assignment[cell]];
-                var rot = rotation[assignment[cell]][cell * 16 + topo[cell]];
-                grid[cell / GridSize, cell % GridSize] = new MapPiecePlacement(piece, rot, piece.GetConnections(rot));
-            }
 
-            Insert(top, topN, new VoyageSolution(grid, score, true));
+            // With per-connection borders, enumerate the arm counts a piece on each such cell
+            // could have under this topology; each profile is separable and scored exactly.
+            foreach (var profile in EnumerateProfiles(perConnCells, groups, reachable[t], topo))
+            {
+                double[][] weight;
+                if (profile == null)
+                {
+                    weight = exactWhenNoPerConn;
+                }
+                else
+                {
+                    Array.Fill(profileConn, -1);
+                    for (var pi = 0; pi < perConnCells.Count; pi++)
+                        profileConn[perConnCells[pi]] = profile[pi];
+                    weight = ComputeWeights(profileConn);
+                }
+
+                var allow = reachable[t];
+                if (profile != null)
+                {
+                    // Restrict per-conn cells to groups whose arm count matches the profile.
+                    allow = (int[])allow.Clone();
+                    for (var pi = 0; pi < perConnCells.Count; pi++)
+                    {
+                        var cell = perConnCells[pi];
+                        for (var g = 0; g < groupCount; g++)
+                            if (groups[g].ArmCount != profile[pi])
+                                allow[g] &= ~(1 << cell);
+                    }
+
+                    // Every cell still needs at least one candidate.
+                    var covered = 0;
+                    for (var g = 0; g < groupCount; g++) covered |= allow[g];
+                    if (covered != States - 1) continue;
+                }
+
+                // Group-level layout penalties apply only where the topology
+                // already realizes the layout's in-grid arms (other cells pay
+                // the flat per-topology penalty instead).
+                if (hasLayout)
+                {
+                    var adjusted = new double[groupCount][];
+                    for (var g = 0; g < groupCount; g++)
+                    {
+                        adjusted[g] = (double[])weight[g].Clone();
+                        for (var cell = 0; cell < Cells; cell++)
+                        {
+                            if (layoutInGrid[cell] >= 0 && topo[cell] == layoutInGrid[cell])
+                                adjusted[g][cell] -= groups[g].LayoutPen[cell];
+                        }
+                    }
+
+                    weight = adjusted;
+                }
+
+                var score = BestAssignment(entries, weight, allow, dpPrev, dpNext, choice, assignment);
+                if (double.IsNegativeInfinity(score)) continue;
+                score -= topoPen[t];
+                if (top.Count >= topN && score <= top[^1].Internal) continue;
+
+                // Map group assignments back to distinct concrete charts. A
+                // group can hold pieces with different BASE orientations (same
+                // canonical rotation set), so the representative's rotation
+                // index must be translated into each member's own rotation that
+                // realizes the same target arms.
+                Array.Clear(groupUse, 0, groupCount);
+                var grid = new MapPiecePlacement[GridSize, GridSize];
+                for (var cell = 0; cell < Cells; cell++)
+                {
+                    var g = assignment[cell];
+                    var group = groups[g];
+                    var piece = pieces[group.Members[groupUse[g]++]];
+                    var targetConn = group.Piece.GetConnections(group.Rotation[cell * 16 + topo[cell]]);
+                    var rot = 0;
+                    for (var r2 = 0; r2 < piece.DistinctRotations; r2++)
+                    {
+                        if (piece.GetConnections(r2) != targetConn) continue;
+                        rot = r2;
+                        break;
+                    }
+
+                    grid[cell / GridSize, cell % GridSize] = new MapPiecePlacement(piece, rot, piece.GetConnections(rot));
+                }
+
+                Insert(top, topN, score,
+                    new VoyageSolution(grid, scorer.Score(grid), true,
+                        strategy != null ? score : null));
+            }
         }
 
-        yield return new VoyageSolutionResult(top, explored, pruned);
+        yield return new VoyageSolutionResult(top.Select(x => x.Solution).ToList(), explored, pruned);
+    }
+
+    private static IEnumerable<int[]> EnumerateProfiles(
+        List<int> perConnCells, List<Group> groups, int[] allow, int[] topo)
+    {
+        if (perConnCells.Count == 0)
+        {
+            yield return null;
+            yield break;
+        }
+
+        // Candidate arm counts per per-conn cell: those of the groups actually eligible there.
+        var options = new List<int>[perConnCells.Count];
+        for (var pi = 0; pi < perConnCells.Count; pi++)
+        {
+            var cell = perConnCells[pi];
+            var counts = new SortedSet<int>();
+            for (var g = 0; g < groups.Count; g++)
+            {
+                if ((allow[g] >> cell & 1) == 0) continue;
+                if ((groups[g].Eligible[cell] >> topo[cell] & 1) == 0) continue;
+                counts.Add(groups[g].ArmCount);
+            }
+
+            if (counts.Count == 0) yield break;
+            options[pi] = counts.ToList();
+        }
+
+        var profile = new int[perConnCells.Count];
+        foreach (var p in Cartesian(options, profile, 0))
+            yield return p;
+    }
+
+    private static IEnumerable<int[]> Cartesian(List<int>[] options, int[] profile, int depth)
+    {
+        if (depth == options.Length)
+        {
+            yield return profile;
+            yield break;
+        }
+
+        foreach (var v in options[depth])
+        {
+            profile[depth] = v;
+            foreach (var p in Cartesian(options, profile, depth + 1))
+                yield return p;
+        }
     }
 
     private static double BestAssignment(
-        int n, double[][] weight, int[] allow, double[] dpPrev, double[] dpNext, byte[][] choice, int[] assignment)
+        int[] entries, double[][] weight, int[] allow, double[] dpPrev, double[] dpNext,
+        byte[][] choice, int[] assignment)
     {
         dpPrev.AsSpan().Fill(double.NegativeInfinity);
         dpPrev[0] = 0;
 
-        for (var i = 0; i < n; i++)
+        for (var i = 0; i < entries.Length; i++)
         {
             var mine = choice[i];
-            var open = allow[i];
-            var w = weight[i];
+            var g = entries[i];
+            var open = allow[g];
+            var w = weight[g];
+
+            mine.AsSpan().Fill(byte.MaxValue);
+            if (open == 0)
+                continue; // dpPrev already holds "entry skipped" for every state.
 
             Array.Copy(dpPrev, dpNext, States);
-            mine.AsSpan().Fill(byte.MaxValue);
 
-            if (open != 0)
+            for (var mask = 0; mask < States; mask++)
             {
-                for (var mask = 0; mask < States; mask++)
-                {
-                    var from = dpPrev[mask];
-                    if (double.IsNegativeInfinity(from)) continue;
+                var from = dpPrev[mask];
+                if (double.IsNegativeInfinity(from)) continue;
 
-                    var free = open & ~mask;
-                    while (free != 0)
-                    {
-                        var bit = free & -free;
-                        free ^= bit;
-                        var cell = BitOperations.TrailingZeroCount(bit);
-                        var value = from + w[cell];
-                        if (value <= dpNext[mask | bit]) continue;
-                        dpNext[mask | bit] = value;
-                        mine[mask | bit] = (byte)cell;
-                    }
+                var free = open & ~mask;
+                while (free != 0)
+                {
+                    var bit = free & -free;
+                    free ^= bit;
+                    var cell = BitOperations.TrailingZeroCount(bit);
+                    var value = from + w[cell];
+                    if (value <= dpNext[mask | bit]) continue;
+                    dpNext[mask | bit] = value;
+                    mine[mask | bit] = (byte)cell;
                 }
             }
 
@@ -313,73 +612,55 @@ public class VoyagePlannerFast
         if (double.IsNegativeInfinity(dpPrev[full])) return double.NegativeInfinity;
 
         var state = full;
-        for (var i = n - 1; i >= 0; i--)
+        for (var i = entries.Length - 1; i >= 0; i--)
         {
             var cell = choice[i][state];
             if (cell == byte.MaxValue) continue;
-            assignment[cell] = i;
+            assignment[cell] = entries[i];
             state ^= 1 << cell;
         }
 
         return dpPrev[full];
     }
 
-    private static void Insert(List<VoyageSolution> top, int topN, VoyageSolution solution)
+    private static void Insert(
+        List<(double Internal, VoyageSolution Solution)> top, int topN, double internalScore, VoyageSolution solution)
     {
         var at = top.Count;
         for (var i = 0; i < top.Count; i++)
         {
-            if (solution.TotalScore <= top[i].TotalScore) continue;
+            if (internalScore <= top[i].Internal) continue;
             at = i;
             break;
         }
 
-        top.Insert(at, solution);
+        top.Insert(at, (internalScore, solution));
         if (top.Count > topN) top.RemoveAt(top.Count - 1);
     }
 
-    private static void ApplyLocks(
-        VoyagePuzzle puzzle,
-        List<MapPiece> pieces,
-        double[][] weight,
-        int[][] eligible)
+    private static void ApplyLockBonuses(List<Group> groups, double[][] weight)
     {
-        if (puzzle.LockedPlacements is not { Count: > 0 })
-            return;
-
-        const double LockBonus = 1e9;
-        var idToIndex = new Dictionary<int, int>(pieces.Count);
-        for (var i = 0; i < pieces.Count; i++)
-            idToIndex[pieces[i].Id] = i;
-
-        foreach (var lp in puzzle.LockedPlacements)
+        for (var g = 0; g < groups.Count; g++)
         {
-            if (!idToIndex.TryGetValue(lp.PieceId, out var pieceIdx))
-                continue;
+            var cell = groups[g].LockedCell;
+            if (cell < 0) continue;
+            if (groups[g].Eligible[cell] == 0) continue;
 
-            var cell = lp.Row * GridSize + lp.Col;
-            if (cell is < 0 or >= Cells)
-                continue;
-
-            for (var c = 0; c < Cells; c++)
+            weight[g][cell] += LockBonus;
+            for (var other = 0; other < groups.Count; other++)
             {
-                if (c == cell) continue;
-                eligible[pieceIdx][c] = 0;
-                weight[pieceIdx][c] = double.NegativeInfinity;
-            }
-
-            if (eligible[pieceIdx][cell] == 0)
-            {
-                continue;
-            }
-
-            weight[pieceIdx][cell] += LockBonus;
-
-            for (var i = 0; i < pieces.Count; i++)
-            {
-                if (i == pieceIdx) continue;
-                weight[i][cell] -= LockBonus;
+                if (other == g) continue;
+                weight[other][cell] -= LockBonus;
             }
         }
+    }
+
+    private static string GetModifierSignature(MapPiece piece)
+    {
+        return string.Join("|", piece.Modifiers
+            .OrderBy(m => m.Tags)
+            .ThenBy(m => m.IsGlobal)
+            .ThenBy(m => m.Weight)
+            .Select(m => $"{(int)m.Tags}:{(m.IsGlobal ? 1 : 0)}:{m.Weight:R}"));
     }
 }

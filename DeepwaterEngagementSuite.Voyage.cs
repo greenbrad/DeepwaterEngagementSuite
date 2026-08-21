@@ -31,11 +31,10 @@ public partial class DeepwaterEngagementSuite
     private VoyageScorer _uiScorer;
     private int _selectedSolutionIndex = 0;
     private bool _voyageSolving;
-    private bool _voyageTimedOut;
     private long _voyageNodesExplored;
     private long _voyageNodesPruned;
-    private double _voyageElapsed;
-    private System.Diagnostics.Stopwatch _voyageStopwatch;
+    private List<StrategySuggestion> _strategySuggestions;
+    private long _nextSuggestionRefreshTicks;
 
     public List<NormalInventoryItem> GetAvailableCharts()
     {
@@ -361,12 +360,108 @@ public partial class DeepwaterEngagementSuite
                 }
             }
 
+        }
+
+        // With a strategy active, label each target tile with the chart the
+        // strategy wants there (border-dependent tiles resolve live). The tile
+        // frame reflects fulfillment: green when the placed chart satisfies
+        // the want, red when the tile is empty or holds the wrong chart; the
+        // label text itself stays light blue.
+        var activeStrategy = VoyageStrategies.ById(settings.SelectedStrategyId.Value);
+        if (activeStrategy != null)
+        {
+            var wanted = StrategyContext.WantedPlacements(activeStrategy, BuildTileBorders(tree));
+            var labelOffsets = new float[tiles.Count];
+            var satisfiedByCell = new Dictionary<int, bool>();
+
+            foreach (var (cell, rule) in wanted)
+            {
+                if (cell >= tiles.Count)
+                    continue;
+
+                var tileRect = tiles[cell].GetClientRectCache;
+                var pos = new Vector2(tileRect.Center.X, tileRect.Top + 4 + labelOffsets[cell]);
+                var size = Graphics.DrawTextWithBackground($"want: {rule.Label}", pos,
+                    Color.Cyan, FontAlign.Center, Color.Black);
+                labelOffsets[cell] += size.Y;
+
+                // Reward-stat wants ("High Quantity") have no binary yes/no;
+                // only chart/room-matcher rules drive the frame color.
+                if (rule.ModPrefixes is not { Length: > 0 } && rule.RoomNames is not { Length: > 0 })
+                    continue;
+
+                var placedEntity = tiles[cell].ItemContainer?.Entity;
+                var placedChart = placedEntity?.GetComponent<DeepwaterChart>();
+                var satisfied = false;
+                if (placedChart != null)
+                {
+                    var placedMods = placedEntity.GetComponent<Mods>()?.ImplicitMods ?? [];
+                    satisfied = StrategyContext.ChartSatisfiesRule(rule,
+                        placedMods.Select(m => m.RawName), placedChart.Room.Name ?? "");
+                }
+
+                satisfiedByCell[cell] = satisfiedByCell.GetValueOrDefault(cell) || satisfied;
+            }
+
+            foreach (var (cell, satisfied) in satisfiedByCell)
+            {
+                var frameRect = tiles[cell].GetClientRectCache;
+                frameRect.Inflate(-2f, -2f);
+                Graphics.DrawFrame(frameRect,
+                    satisfied ? settings.GoodChartColor : settings.JunkChartColor, 2);
+            }
+        }
+
+        if (settings.DrawComboLabels.Value || settings.HighlightChartQuality.Value)
+        {
             var charts = GetAvailableCharts();
             var specialtyIndices = GetInventorySpecialtyIndices(charts);
 
             for (int i = 0; i < charts.Count; i++)
             {
-                var pos = charts[i].GetClientRectCache.TopLeft.ToVector2Num();
+                // Hidden-tab charts share screen rects with the visible tab;
+                // drawing for them would stack wrong labels over other charts.
+                if (!charts[i].IsVisible)
+                    continue;
+
+                var rect = charts[i].GetClientRectCache;
+
+                if (settings.HighlightChartQuality.Value)
+                {
+                    // With a strategy active, keepers (other strategies' fuel,
+                    // held out of this strategy's pool) show violet so it's
+                    // clear why the solver won't burn them.
+                    var reserved = activeStrategy != null &&
+                                   settings.ProtectKeeperCharts.Value &&
+                                   VoyageStrategies.IsReservedChart(activeStrategy,
+                                       (charts[i].Item?.GetComponent<Mods>()?.ImplicitMods ?? [])
+                                       .Select(m => m.RawName),
+                                       charts[i].Item?.GetComponent<DeepwaterChart>()?.Room.Name ?? "");
+
+                    Color frameColor;
+                    if (reserved || (activeStrategy == null && specialtyIndices.Contains(i)))
+                    {
+                        frameColor = settings.SpecialtyChartColor;
+                    }
+                    else
+                    {
+                        var score = ChartHighlightScore(charts[i], activeStrategy);
+                        frameColor = score >= settings.GoodChartThreshold.Value
+                            ? settings.GoodChartColor
+                            : score > 0
+                                ? settings.UsefulChartColor
+                                : settings.JunkChartColor;
+                    }
+
+                    var frameRect = rect;
+                    frameRect.Inflate(-1.5f, -1.5f);
+                    Graphics.DrawFrame(frameRect, frameColor, 2);
+                }
+
+                if (!settings.DrawComboLabels.Value)
+                    continue;
+
+                var pos = rect.TopLeft.ToVector2Num();
                 if (specialtyIndices.Contains(i))
                 {
                     var exclSize = Graphics.DrawTextWithBackground("!", pos, Color.Violet, Color.Black);
@@ -630,6 +725,44 @@ public partial class DeepwaterEngagementSuite
             DumpElementRecursive(writer, children[i], path.Length == 0 ? i.ToString() : $"{path}.{i}", depth + 1);
     }
 
+    // How valuable a chart looks for the highlight frames: the active
+    // strategy's weights plus its positive rule matches (scaled into weight
+    // range), or the user's configured chart modifier weights otherwise.
+    private double ChartHighlightScore(NormalInventoryItem chart, VoyageStrategy strategy)
+    {
+        var chartMods = chart.Item?.GetComponent<Mods>()?.ImplicitMods ?? [];
+
+        if (strategy == null)
+        {
+            double configured = 0;
+            foreach (var im in chartMods)
+            {
+                var cm = Settings.VoyageSettings.ChartModifiers.Content
+                    .FirstOrDefault(c => c.Id.Value.Equals(im.RawName, StringComparison.OrdinalIgnoreCase));
+                configured += cm?.Weight.Value ?? 0;
+            }
+
+            return configured;
+        }
+
+        var room = chart.Item?.GetComponent<DeepwaterChart>()?.Room.Name ?? "";
+        var score = chartMods.Sum(im => strategy.WeightFor(im.RawName));
+        foreach (var rule in strategy.Rules)
+        {
+            if (rule.Bonus <= 0)
+                continue;
+
+            var matchesMod = rule.ModPrefixes is { Length: > 0 } && chartMods.Any(im =>
+                rule.ModPrefixes.Any(p => im.RawName.StartsWith(p, StringComparison.OrdinalIgnoreCase)));
+            var matchesRoom = rule.RoomNames is { Length: > 0 } &&
+                              rule.RoomNames.Any(r => room.Contains(r, StringComparison.OrdinalIgnoreCase));
+            if (matchesMod || matchesRoom)
+                score += rule.Bonus / 10.0;
+        }
+
+        return score;
+    }
+
     private static Dictionary<int, List<ItemMod>> GetTileMods(VoyageWindow tree)
     {
         var borderMods = tree.Data.BorderMods;
@@ -665,22 +798,133 @@ public partial class DeepwaterEngagementSuite
         }
 
         _voyageSolving = _run is { IsCompleted: false };
-        
+
+        // Suggest the best-fitting strategy for the rolled borders and the
+        // current chart inventory (refreshed twice a second, not per frame).
+        var nowTicks = DateTime.UtcNow.Ticks;
+        if (_strategySuggestions == null || nowTicks >= _nextSuggestionRefreshTicks)
+        {
+            var chartInfos = GetAvailableCharts()
+                .Select(ch => (
+                    (IReadOnlyList<string>)(ch.Item?.GetComponent<Mods>()?.ImplicitMods ?? [])
+                    .Select(m => m.RawName).ToList(),
+                    ch.Item?.GetComponent<DeepwaterChart>()?.Room.Name ?? ""))
+                .ToList();
+            _strategySuggestions = VoyageStrategies.RankStrategies(chartInfos, BuildTileBorders(tree));
+            _nextSuggestionRefreshTicks = nowTicks + TimeSpan.TicksPerMillisecond * 500;
+        }
+
+        if (_strategySuggestions is { Count: > 0 })
+        {
+            var best = _strategySuggestions[0];
+            ImGui.TextColored((best.Ready ? Color.LimeGreen : Color.Orange).ToImguiVec4(),
+                $"Suggested: {best.Strategy.Name}");
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Use"))
+            {
+                Settings.VoyageSettings.SelectedStrategyId.Value = best.Strategy.Id;
+                Settings.VoyageSettings.SelectedStrategyLayoutId.Value = "";
+            }
+
+            var reasonBits = new List<string>();
+            if (best.Strategy.RequiredBorderId != null)
+                reasonBits.Add("required border rolled");
+            reasonBits.Add(best.Ready
+                ? best.RequirementsTotal > 0 ? "all pieces ready" : "always runnable"
+                : $"missing: {string.Join(", ", best.Missing)}");
+            ImGui.TextDisabled(string.Join("; ", reasonBits));
+
+            // What the player is still collecting toward: the highest-payoff
+            // strategy that isn't ready yet.
+            var banking = _strategySuggestions
+                .Where(s => !s.Ready && s.Strategy.SuggestionWeight > best.Strategy.SuggestionWeight)
+                .OrderByDescending(s => s.Strategy.SuggestionWeight)
+                .FirstOrDefault();
+            if (banking != null)
+            {
+                ImGui.TextDisabled(
+                    $"Banking toward {banking.Strategy.Name} - missing: {string.Join(", ", banking.Missing.Take(3))}");
+            }
+        }
+
+        ImGui.Spacing();
+
+        // Strategy picker: curated community strategies (ported from
+        // one-more-map) that override reward weights and shape placement.
+        var strategies = VoyageStrategies.All;
+        var strategyNames = new string[strategies.Count + 1];
+        strategyNames[0] = "None (built-in rules)";
+        var strategyIndex = 0;
+        for (var i = 0; i < strategies.Count; i++)
+        {
+            strategyNames[i + 1] = strategies[i].Name;
+            if (strategies[i].Id == Settings.VoyageSettings.SelectedStrategyId.Value)
+                strategyIndex = i + 1;
+        }
+
+        ImGui.SetNextItemWidth(230);
+        if (ImGui.Combo("Strategy", ref strategyIndex, strategyNames, strategyNames.Length))
+        {
+            Settings.VoyageSettings.SelectedStrategyId.Value =
+                strategyIndex == 0 ? "" : strategies[strategyIndex - 1].Id;
+            Settings.VoyageSettings.SelectedStrategyLayoutId.Value = "";
+        }
+
+        var selectedStrategy = strategyIndex > 0 ? strategies[strategyIndex - 1] : null;
+        if (selectedStrategy != null)
+        {
+            ImGui.TextDisabled(selectedStrategy.Tagline);
+
+            if (selectedStrategy.Layouts is { Length: > 1 })
+            {
+                var layoutNames = selectedStrategy.Layouts.Select(l => l.Label).ToArray();
+                var layoutIndex = Math.Max(0, Array.FindIndex(selectedStrategy.Layouts,
+                    l => l.Id == Settings.VoyageSettings.SelectedStrategyLayoutId.Value));
+                ImGui.SetNextItemWidth(230);
+                if (ImGui.Combo("Layout", ref layoutIndex, layoutNames, layoutNames.Length))
+                {
+                    Settings.VoyageSettings.SelectedStrategyLayoutId.Value =
+                        selectedStrategy.Layouts[layoutIndex].Id;
+                }
+            }
+
+            var protect = Settings.VoyageSettings.ProtectKeeperCharts.Value;
+            if (ImGui.Checkbox("Protect keeper charts", ref protect))
+                Settings.VoyageSettings.ProtectKeeperCharts.Value = protect;
+
+            if (_voyageSolve != null && _voyageSolve.ReservedCount > 0)
+            {
+                ImGui.SameLine();
+                ImGui.TextDisabled($"({_voyageSolve.ReservedCount} held back)");
+            }
+
+            if (_voyageSolve is { NotEnoughFreeCharts: true })
+            {
+                ImGui.TextColored(Color.Orange.ToImguiVec4(),
+                    "Not enough free charts to fill the board - untick protection or bank more junk charts.");
+            }
+
+            if (ImGui.TreeNode("Strategy guide"))
+            {
+                foreach (var line in selectedStrategy.Guide)
+                    ImGui.TextWrapped($"- {line}");
+                ImGui.TreePop();
+            }
+        }
+
+        var selectedLayoutId = Settings.VoyageSettings.SelectedStrategyLayoutId.Value;
+        var protectKeepers = Settings.VoyageSettings.ProtectKeeperCharts.Value;
+
         if (ImGui.Button("Solve"))
         {
-            _voyageSolve?.Cancel();
             _result = null;
             _selectedSolutionIndex = 0;
             _voyageNodesExplored = 0;
             _voyageNodesPruned = 0;
-            _voyageElapsed = 0;
-            _voyageTimedOut = false;
-            _voyageStopwatch = System.Diagnostics.Stopwatch.StartNew();
             _run = Task.Run(() =>
             {
-                var pieces = BuildMapPiecesFromAvailableCharts();
+                var pieces = BuildMapPiecesFromAvailableCharts(selectedStrategy);
                 var tileBorders = BuildTileBorders(tree);
-                var timeLimitSetting = Settings.VoyageSettings.SolverTimeLimitSeconds.Value;
 
                 var session = new VoyageSolve();
                 _voyageSolve = session;
@@ -688,8 +932,10 @@ public partial class DeepwaterEngagementSuite
                 foreach (var r in session.Run(
                              pieces,
                              tileBorders,
-                             useFastSolver: Settings.VoyageSettings.UseFastSolver.Value,
-                             settings: new VoyagePlannerSettings(TimeLimitSeconds: timeLimitSetting)))
+                             settings: new VoyagePlannerSettings(),
+                             strategy: selectedStrategy,
+                             strategyLayoutId: selectedLayoutId,
+                             protectKeepers: protectKeepers))
                 {
                     _result = r;
                     _voyageNodesExplored = r.NodesExplored;
@@ -699,10 +945,6 @@ public partial class DeepwaterEngagementSuite
 
                 _uiScorer = session.Scorer;
                 LogPlacement(session.Placement);
-
-                if (_voyageStopwatch.Elapsed.TotalSeconds >= timeLimitSetting)
-                    _voyageTimedOut = true;
-
                 _voyageSolving = false;
             });
         }
@@ -711,23 +953,6 @@ public partial class DeepwaterEngagementSuite
         if (ImGui.Button("Dump UI"))
         {
             DumpVoyageUi(tree);
-        }
-
-        if (_voyageSolve != null && _voyageSolving && !Settings.VoyageSettings.UseFastSolver.Value)
-        {
-            ImGui.SameLine();
-            if (ImGui.Button("Cancel"))
-                _voyageSolve.Cancel();
-        }
-
-        if (_voyageSolving)
-        {
-            if (_voyageStopwatch != null)
-                _voyageElapsed = _voyageStopwatch.Elapsed.TotalSeconds;
-            ImGui.SameLine();
-            var timeLimitSetting = Settings.VoyageSettings.SolverTimeLimitSeconds.Value;
-            var progress = timeLimitSetting > 0 ? Math.Min(1f, (float)(_voyageElapsed / timeLimitSetting)) : 0.5f;
-            ImGui.ProgressBar(progress, default, $"{_voyageElapsed:F1}s");
         }
 
         if (_result != null && _result.Solutions.Count > 0)
@@ -755,10 +980,6 @@ public partial class DeepwaterEngagementSuite
             {
                 ImGui.TextColored(Color.Yellow.ToImguiVec4(), "Searching...");
             }
-            else if (_voyageTimedOut)
-            {
-                ImGui.TextColored(Color.Orange.ToImguiVec4(), "Time limit reached - no valid solution found.");
-            }
             else
             {
                 ImGui.TextColored(Color.Gray.ToImguiVec4(), "No solutions yet. Press Solve.");
@@ -766,11 +987,6 @@ public partial class DeepwaterEngagementSuite
 
             ImGui.End();
             return;
-        }
-
-        if (_voyageTimedOut)
-        {
-            ImGui.TextColored(Color.Orange.ToImguiVec4(), $"Time limit reached - showing best solutions found so far (may not be optimal).");
         }
 
         _selectedSolutionIndex = Math.Clamp(_selectedSolutionIndex, 0, _result.Solutions.Count - 1);
@@ -787,15 +1003,29 @@ public partial class DeepwaterEngagementSuite
         ImGui.Spacing();
 
         ImGui.Text($"Score: {currentSolution.TotalScore:F2}");
+        if (currentSolution.StrategyObjective is { } currentObjective)
+        {
+            ImGui.SameLine();
+            ImGui.TextDisabled($"(strategy objective: {currentObjective:F2})");
+        }
+
         ImGui.Text($"Valid: {(currentSolution.IsValid ? "Yes" : "No")}");
 
         if (_result.Solutions.Count > 0)
         {
+            // With a strategy active the list ranks by the strategy objective
+            // (reward + rule bonuses - layout penalties), not raw reward, so
+            // show the objective column to make the ordering legible.
+            var showObjective = _result.Solutions.Any(s => s.StrategyObjective.HasValue);
+
             ImGui.Spacing();
-            if (ImGui.BeginTable("SolutionsList", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.SizingStretchProp))
+            if (ImGui.BeginTable("SolutionsList", showObjective ? 5 : 4,
+                    ImGuiTableFlags.Borders | ImGuiTableFlags.SizingStretchProp))
             {
                 ImGui.TableSetupColumn("#");
                 ImGui.TableSetupColumn("Score");
+                if (showObjective)
+                    ImGui.TableSetupColumn("Objective");
                 ImGui.TableSetupColumn("Valid");
                 ImGui.TableSetupColumn("Select");
                 ImGui.TableHeadersRow();
@@ -809,6 +1039,12 @@ public partial class DeepwaterEngagementSuite
                     ImGui.Text($"{i + 1}");
                     ImGui.TableNextColumn();
                     ImGui.Text($"{sol.TotalScore:F2}");
+                    if (showObjective)
+                    {
+                        ImGui.TableNextColumn();
+                        ImGui.Text(sol.StrategyObjective is { } obj ? $"{obj:F2}" : "-");
+                    }
+
                     ImGui.TableNextColumn();
                     ImGui.Text($"{sol.IsValid}");
                     ImGui.TableNextColumn();
@@ -1080,7 +1316,7 @@ public partial class DeepwaterEngagementSuite
         }
     }
 
-    private List<MapPiece> BuildMapPiecesFromAvailableCharts()
+    private List<MapPiece> BuildMapPiecesFromAvailableCharts(VoyageStrategy strategy = null)
     {
         var pieces = new List<MapPiece>();
         var i = 0;
@@ -1090,6 +1326,33 @@ public partial class DeepwaterEngagementSuite
             {
                 var rotation = (Direction)c.Room.Path;
                 var chartName = c.Room.Name ?? "";
+                var itemMods = chart.Item.GetComponent<Mods>();
+
+                var modifiers = new List<Modifier> { new("Default", 1) };
+                foreach (var im in itemMods?.ImplicitMods ?? [])
+                {
+                    var chartMod = Settings.VoyageSettings.ChartModifiers.Content
+                        .FirstOrDefault(cm => cm.Id.Value.Equals(im.RawName, StringComparison.OrdinalIgnoreCase));
+
+                    // An active strategy replaces the configured weights with
+                    // its own (unlisted mods count 0), per the source strategy
+                    // definitions; tags stay user-configured.
+                    var weight = strategy?.WeightFor(im.RawName) ?? chartMod?.Weight.Value ?? 0;
+                    var isGlobal = strategy != null
+                        ? im.RawName.StartsWith("MapDeepwaterChartVoyage", StringComparison.Ordinal)
+                        : chartMod?.IsGlobal.Value ?? false;
+                    modifiers.Add(new Modifier(im.RawName, weight, isGlobal,
+                        ModifierTagParser.Parse(chartMod?.Tags.Value, ModifierTag.None), im.Value1));
+                }
+
+                if (strategy != null)
+                {
+                    // Weight-0 explicit (map) mods so strategy reward-stat rules
+                    // can see quantity/sulphur/pack rolls; they never score.
+                    foreach (var em in itemMods?.ExplicitMods ?? [])
+                        modifiers.Add(new Modifier(em.RawName, 0, false, ModifierTag.None, em.Value1));
+                }
+
                 pieces.Add(new MapPiece(i,
                     int.PopCount((int)rotation) switch
                     {
@@ -1100,15 +1363,7 @@ public partial class DeepwaterEngagementSuite
                             ? PieceType.Straight
                             : PieceType.Corner,
                         _ => PieceType.Single
-                    }, rotation, [
-                        new Modifier("Default", 1), ..chart.Item.GetComponent<Mods>()?.ImplicitMods.Select(im =>
-                        {
-                            var chartMod = Settings.VoyageSettings.ChartModifiers.Content
-                                .FirstOrDefault(cm => cm.Id.Value.Equals(im.RawName, StringComparison.OrdinalIgnoreCase));
-                            return new Modifier(im.RawName, chartMod?.Weight.Value ?? 0, chartMod?.IsGlobal.Value ?? false,
-                                ModifierTagParser.Parse(chartMod?.Tags.Value, ModifierTag.None), im.Value1);
-                        }) ?? []
-                    ], chartName));
+                    }, rotation, modifiers, chartName));
             }
 
             i++;

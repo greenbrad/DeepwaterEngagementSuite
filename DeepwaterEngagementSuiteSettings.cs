@@ -497,6 +497,35 @@ public class VoyageSettings
     [Menu("Show optimizer window")]
     public ToggleNode ShowOptimizerWindow { get; set; } = new ToggleNode(true);
 
+    // Set from the optimizer window's Strategy dropdown; empty = built-in rules.
+    [IgnoreMenu]
+    public TextNode SelectedStrategyId { get; set; } = new TextNode("");
+
+    [IgnoreMenu]
+    public TextNode SelectedStrategyLayoutId { get; set; } = new TextNode("");
+
+    [Menu("Protect keeper charts",
+        "With a strategy selected, hold back charts that other strategies need (Divine/Meatfish/Ethereal " +
+        "fuel) so burn strategies only spend true junk. Keepers show a violet frame in the chart inventory.")]
+    public ToggleNode ProtectKeeperCharts { get; set; } = new ToggleNode(true);
+
+    [Menu("Highlight chart quality",
+        "Color-codes charts in the chart inventory: violet = specialty combo piece, green = good, " +
+        "yellow = some value, red = junk. When a strategy is selected, charts are judged by that " +
+        "strategy's weights and rules instead of the configured chart modifier weights.")]
+    public ToggleNode HighlightChartQuality { get; set; } = new ToggleNode(true);
+
+    [Menu("Good chart threshold", "Summed weight at which a chart's frame turns green.")]
+    public RangeNode<int> GoodChartThreshold { get; set; } = new RangeNode<int>(6, 1, 30);
+
+    public ColorNode GoodChartColor { get; set; } = new ColorNode(SharpDX.Color.LimeGreen);
+
+    public ColorNode UsefulChartColor { get; set; } = new ColorNode(SharpDX.Color.Yellow);
+
+    public ColorNode JunkChartColor { get; set; } = new ColorNode(new SharpDX.Color(220, 40, 40, 160));
+
+    public ColorNode SpecialtyChartColor { get; set; } = new ColorNode(SharpDX.Color.Violet);
+
     [Menu("Draw combo labels",
         "Overlay specialty combo pieces (Pelagic/farm rooms, starfish, rares, boxes, Lost Message) and strategy borders " +
         "(orbs, scarabs, strong treasure anchors). No-consume borders are used for strategy but not labeled. " +
@@ -507,12 +536,6 @@ public class VoyageSettings
         "Verbose optimizer tables: per-tile (row,col) score breakdown and contribution sources. " +
         "Off by default — strategy labels stay available without this noise.")]
     public ToggleNode ShowScoreDebugDetails { get; set; } = new ToggleNode(false);
-
-    [Menu("Solver time limit (seconds)", "Max time the solver runs before returning the best solution found so far. 0 = no limit.")]
-    public RangeNode<int> SolverTimeLimitSeconds { get; set; } = new RangeNode<int>(5, 1, 120);
-
-    [Menu("Use fast solver (exact, experimental)", "Exact branch-and-bound solver. Ignores the time limit. Per-connection border mods are ignored for now, so scores on those boards are approximate.")]
-    public ToggleNode UseFastSolver { get; set; } = new ToggleNode(true);
 
     public ToggleNode ShowAllBorderModifiers { get; set; } = new ToggleNode(true);
     public ToggleNode ShowAllChartModifiers { get; set; } = new ToggleNode(true);
